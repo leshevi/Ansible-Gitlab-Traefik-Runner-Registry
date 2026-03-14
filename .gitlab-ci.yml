@@ -9,20 +9,19 @@ variables:
   ANSIBLE_REMOTE_TMP: /tmp
   ANSIBLE_FORCE_COLOR: 'true'
   ANSIBLE_STARATEGY: linear
-  ANSIBLE_PIPELINING: 1
+  ANSIBLE_PIPELINING: "1"
   ANSIBLE_TRANSPORT: ssh
-  ANSIBLE_BECOME_METHOD: su
+  ANSIBLE_BECOME_METHOD: sudo
   ANSIBLE_BECOME_USER: root
-  ANSIBLE_BECOME_ASKPASS: 'False'
-  ANSIBLE_FORCE_HANDLER: 'True'
-  ANSIBLE_ASK_PASS: 'False'
-  ANSIBLE_NOCOWS: 1
-  ANSIBLE_STDOUT_CALLBACK: "ansible.builtin.default"
+  ANSIBLE_BECOME_ASKPASS: 'false'
+  ANSIBLE_FORCE_HANDLER: 'true'
+  ANSIBLE_ASK_PASS: 'false'
+  ANSIBLE_NOCOWS: "1"
+  ANSIBLE_STDOUT_CALLBACK: "yaml"
   ANSIBLE_RESULT_FORMAT: yaml
   ANSIBLE_HOST_KEY_CHECKING: 'false'
   DEPRECATION_WARNINGS: 'false'
   ANSIBLE_TIMEOUT: 30
-  ANSIBLE_BECOME_EXE: 'sudo -p "Password: " su -'
   HOSTS_FILE: hosts.yml
 
 .job_inj:
@@ -38,7 +37,7 @@ image: registry.gitlab.com/ansible_playbooks7843206/best_practices_alpine/ee:doc
   tags:
     - Docker
   variables:
-    SERVER_IPS: 193.164.149.59
+    SERVER_IPS: 193.164.14.5
     SERVER_NAMES: gitlab
   extends: .job_inj
   script:
