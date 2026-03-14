@@ -1,0 +1,292 @@
+- name: Ensure dependencies are installed (GitLab)
+  ansible.builtin.package:
+    name:
+      - curl
+      - openssh-server
+      - ca-certificates
+      - perl
+      - postfix
+      - gnupg
+      - software-properties-common
+      - git
+      - wget
+      - openssh-client
+      - rsync
+      - ufw
+      - python3-prettytable
+    state: present
+    update_cache: true
+
+- name: Creating the necessary directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    mode: "{{ item.mode | default('0755') }}"
+  loop:
+    - { path: "{{ gitlab_docker }}" }
+    - { path: "{{ gitlab_docker }}/config" }
+    - { path: "{{ gitlab_docker }}/data" }
+    - { path: "{{ gitlab_docker }}/logs" }
+    - { path: "{{ gitlab_traefik }}" }
+    - { path: "{{ gitlab_traefik }}/letsencrypt", mode: '0700' }
+
+- name: Create a directory for the Docker config
+  ansible.builtin.file:
+    path: "/root/.docker"
+    state: directory
+    mode: '0700'
+  become: true
+
+- name: Login to Docker
+  community.docker.docker_login:
+    username: "leshevi1"
+    password: "{{ vault_docker_password }}"
+    config_path: "/root/.docker/config.json"
+    state: present
+  become: true
+  no_log: true
+
+- name: Creating a Docker network
+  community.docker.docker_network:
+    name: "{{ gitlab_network_name }}"
+    driver: bridge
+    state: present
+
+- name: Create Traefik container
+  community.docker.docker_container:
+    name: traefik
+    image: "traefik:{{ gitlab_traefik_version }}"
+    restart_policy: always
+    networks:
+      - name: "{{ gitlab_network_name }}"
+    ports:
+      - "80:80"
+      - "443:443"
+      - "2424:2424"
+    env: |
+      CF_API_EMAIL=leshevi2022@gmail.com
+      DOCKER_API_VERSION: "1.44"
+      CF_DNS_API_TOKEN=Pms1jtcfqwHiCJxa_rjXHNcLgP3ds_2GhhKJ5XyB
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "{{ gitlab_traefik }}/letsencrypt:/letsencrypt"
+    command:
+      - "--api.dashboard=true"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.ssh.address=:2424"
+      # Настройка DNS Challenge вместо TLS Challenge
+      - "--certificatesresolvers.myresolver.acme.dnschallenge=true"
+      - "--certificatesresolvers.myresolver.acme.dnschallenge.provider=cloudflare"
+      - "--certificatesresolvers.myresolver.acme.email={{ gitlab_admin_email }}"
+      - "--certificatesresolvers.myresolver.acme.storage=/letsencrypt/acme.json"
+      # Опционально: использовать DNS Cloudflare для проверки (быстрее)
+      - "--certificatesresolvers.myresolver.acme.dnschallenge.resolvers=1.1.1.1:53,8.8.8.8:53"
+    labels:
+      # Настройка дашборда Traefik
+      traefik.enable: "true"
+      traefik.http.routers.api.rule: "Host(`{{ gitlab_traefik_domain }}`)"
+      traefik.http.routers.api.entrypoints: "websecure"
+      traefik.http.routers.api.service: "api@internal"
+      traefik.http.routers.api.tls: "true"
+      traefik.http.routers.api.tls.certresolver: "myresolver"
+      traefik.http.routers.api.middlewares: "auth"
+      traefik.http.middlewares.auth.basicauth.users: "{{ gitlab_traefik_auth }}"
+      traefik.http.routers.registry.rule: "Host(`{{ gitlab_registry_domain }}`)"
+      traefik.http.routers.registry.entrypoints: "websecure"
+      traefik.http.routers.registry.tls: "true"
+      traefik.http.routers.registry.tls.certresolver: "myresolver"
+      traefik.http.routers.registry.service: "registry-svc"
+      # Важно: Registry в Omnibus слушает на 5005 по умолчанию
+      traefik.http.services.registry-svc.loadbalancer.server.port: "5005"
+
+- name: Wait for API
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host }}"
+    port: 443
+    timeout: 30
+    delay: 5
+
+- name: Create Gitlab container
+  community.docker.docker_container:
+    name: gitlab
+    image: "gitlab/gitlab-ce:{{ gitlab_version }}"
+    restart_policy: always
+    networks:
+      - name: "{{ gitlab_network_name }}"
+    volumes:
+      - "{{ gitlab_docker }}/config:/etc/gitlab"
+      - "{{ gitlab_docker }}/logs:/var/log/gitlab"
+      - "{{ gitlab_docker }}/data:/var/opt/gitlab"
+    env:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'https://{{ gitlab_domain_name }}'
+        nginx['listen_port'] = 80
+        nginx['listen_https'] = false
+        nginx['proxy_set_headers'] = {
+          "X-Forwarded-Proto" => "https",
+          "X-Forwarded-Ssl" => "on"
+        }
+        registry_external_url 'https://{{ gitlab_registry_domain }}'
+        gitlab_rails['registry_enabled'] = true
+        # Registry будет слушать внутри контейнера на порту 5005
+        registry_nginx['listen_port'] = 5005
+        registry_nginx['listen_https'] = false
+        registry_nginx['proxy_set_headers'] = {
+          "X-Forwarded-Proto" => "https",
+          "X-Forwarded-Ssl" => "on"
+        }
+        gitlab_rails['gitlab_shell_ssh_port'] = 2424
+        gitlab_rails['smtp_enable'] = false
+    labels:
+      traefik.enable: "true"
+      # HTTP -> HTTPS Redirect
+      traefik.http.routers.gitlab.rule: "Host(`{{ gitlab_domain_name }}`)"
+      traefik.http.routers.gitlab.entrypoints: "web"
+      traefik.http.routers.gitlab.middlewares: "gitlab-redirect"
+      traefik.http.middlewares.gitlab-redirect.redirectscheme.scheme: "https"
+      # HTTPS
+      traefik.http.routers.gitlab-secure.rule: "Host(`{{ gitlab_domain_name }}`)"
+      traefik.http.routers.gitlab-secure.entrypoints: "websecure"
+      traefik.http.routers.gitlab-secure.tls: "true"
+      traefik.http.routers.gitlab-secure.tls.certresolver: "myresolver"
+      traefik.http.routers.gitlab-secure.service: "gitlab-svc"
+      traefik.http.services.gitlab-svc.loadbalancer.server.port: "80"
+      # SSH (TCP)
+      traefik.tcp.routers.gitlab-ssh.rule: "HostSNI(`*`)"
+      traefik.tcp.routers.gitlab-ssh.entrypoints: "ssh"
+      traefik.tcp.routers.gitlab-ssh.service: "gitlab-ssh-svc"
+      traefik.tcp.services.gitlab-ssh-svc.loadbalancer.server.port: "22"
+    shm_size: '256m'
+
+
+- name: Waiting for administrator password generation (may take up to 5 minutes)
+  ansible.builtin.wait_for:
+    path: "{{ gitlab_docker }}/config/initial_root_password"
+    state: present
+    timeout: 600 # Ждем до 10 минут
+  register: gitlab_password_file_check
+
+- name: Reading the temporary root password
+  ansible.builtin.command: "grep 'Password:' {{ gitlab_docker }}/config/initial_root_password"
+  register: gitlab_root_password
+  changed_when: false
+  when: gitlab_password_file_check.state is defined
+
+- name: OUTPUT ROOT PASSWORD
+  ansible.builtin.debug:
+    msg:
+      - "--------------------------------------------------------"
+      - "GITLAB ГОТОВ К РАБОТЕ!"
+      - "URL: https://{{ gitlab_domain_name }}"
+      - "Login: root"
+      - "{{ gitlab_root_password.stdout }}"
+      - "ВНИМАНИЕ: Пароль удалится через 24 часа. Смените его в профиле."
+      - "--------------------------------------------------------"
+
+- name: Preparing a directory for GitLab Runner
+  ansible.builtin.file:
+    path: "{{ gitlab_docker }}/runner"
+    state: directory
+    mode: '0755'
+
+- name: Launching the GitLab Runner container
+  community.docker.docker_container:
+    name: gitlab-runner
+    image: gitlab/gitlab-runner:latest
+    restart_policy: always
+    networks:
+      - name: "{{ gitlab_network_name }}"
+    volumes:
+      - "{{ gitlab_docker }}/runner:/etc/gitlab-runner"
+      - "/var/run/docker.sock:/var/run/docker.sock" # Для запуска Docker-in-Docker задач
+
+- name: RUNNER REGISTRATION INSTRUCTIONS
+  ansible.builtin.debug:
+    msg:
+      - "--------------------------------------------------------"
+      - "ЧТОБЫ ЗАРЕГИСТРИРОВАТЬ РАННЕР, ВЫПОЛНИТЕ НА СЕРВЕРЕ:"
+      - "1. Зайдите в GitLab -> Admin Area -> CI/CD -> Runners"
+      - "2. Скопируйте Registration Token"
+      - "3. Запустите команду:"
+      - "docker exec -it gitlab-runner gitlab-runner register \\"
+      - "  --non-interactive \\"
+      - "  --url 'http://gitlab/' \\" # Используем внутреннее имя контейнера
+      - "  --registration-token 'ВАШ_ТОКЕН' \\"
+      - "  --executor 'docker' \\"
+      - "  --docker-image alpine:latest \\"
+      - "  --description 'my-docker-runner' \\"
+      - "  --docker-network-mode '{{ gitlab_network_name }}'"
+      - "--------------------------------------------------------"
+
+- name: Obtaining a registration token from GitLab
+  community.docker.docker_container_exec:
+    container: gitlab
+    command: gitlab-rails runner "puts Gitlab::CurrentSettings.current_application_settings.runners_registration_token"
+  register: gitlab_runner_token_raw
+  until: gitlab_runner_token_raw.stdout != ""
+  retries: 10
+  delay: 30
+
+- name: Clearing the token of unnecessary characters
+  ansible.builtin.set_fact:
+    gitlab_registration_token: "{{ gitlab_runner_token_raw.stdout | trim }}"
+
+- name: Automatic GitLab Runner Registration
+  community.docker.docker_container_exec:
+    container: gitlab-runner
+    command: >
+      gitlab-runner register
+      --non-interactive
+      --url "http://gitlab/"
+      --registration-token "{{ gitlab_registration_token }}"
+      --executor "docker"
+      --docker-image "alpine:latest"
+      --description "auto-registered-runner"
+      --tag-list "docker,shared"
+      --docker-network-mode "{{ gitlab_network_name }}"
+      --docker-privileged="true"
+    timeout: 300
+  register: gitlab_runner_reg_result
+  until: gitlab_runner_reg_result.rc == 0 or 'already exists' in gitlab_runner_reg_result.stderr
+  retries: 5
+  delay: 10
+  changed_when: "'Runner registered successfully' in gitlab_runner_reg_result.stdout"
+  failed_when:
+    - gitlab_runner_reg_result.rc != 0
+    - "'already exists' not in gitlab_runner_reg_result.stderr"
+
+- name: FINAL STATUS
+  ansible.builtin.debug:
+    msg:
+      - "ВСЁ ГОТОВО!"
+      - "GitLab: https://{{ gitlab_domain_name }}"
+      - "Traefik Dashboard: https://{{ gitlab_traefik_domain }}"
+      - "Runner зарегистрирован автоматически: {{ 'УСПЕХ' if gitlab_runner_reg_result.rc == 0 else 'УЖЕ БЫЛ' }}"
+
+- name: Checking interface availability
+  ansible.builtin.uri:
+    url: "https://{{ gitlab_domain_name }}"
+    validate_certs: false # Пока сертификат Let's Encrypt еще выписывается
+    status_code: 200
+  register: gitlab_web_check
+  until: gitlab_web_check.status == 200
+  retries: 30
+  delay: 20
+
+- name: HOORAY!
+  ansible.builtin.debug:
+    msg: "GitLab доступен! Заходите под root, создавайте проект и пушьте .gitlab-ci.yml"
+
+- name: Allow HTTP and HTTPS in firewall
+  community.general.ufw:
+    rule: allow
+    port: "{{ item }}"
+    proto: tcp
+  loop:
+    - "80"
+    - "443"
+    - "2424"
+    - "22"
