@@ -1,0 +1,6 @@
+gitlab_network_name: "gitlab_network"
+gitlab_domain_name: "domain.gitlab"
+gitlab_traefik_domain: "domain.traefik"
+gitlab_admin_email: ""
+gitlab_traefik_auth: "leshevi:$2y$05$mYWBcFyVT8muLBv....." # passwd only in this format, without the second ones $
+gitlab_registry_domain: "domain.reg"
