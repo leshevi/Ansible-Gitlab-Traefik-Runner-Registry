@@ -1,0 +1,5 @@
+gitlab_docker: "/opt/gitlab"
+gitlab_traefik: "/opt/traefik"
+gitlab_traefik_version: "v3.6.2"
+gitlab_version: "latest"
+gitlab_network_name: "gitlab_network"
